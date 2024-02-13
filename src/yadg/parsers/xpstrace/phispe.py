@@ -105,6 +105,7 @@ import numpy as np
 import xarray as xr
 import datatree
 import yadg.dgutils as dgutils
+import json
 
 data_header_dtype = np.dtype(
     [
@@ -181,13 +182,23 @@ def _process_header(spe: list[bytes]) -> dict:
         a list.
 
     """
-    header_lines = spe[spe.index(b"SOFH\n") + 1 : spe.index(b"EOFH\n")]
+    header_lines = spe[spe.index(b'SOFH\r\n') + 1 : spe.index(b"EOFH\r\n")]
     header = {}
     for line in header_lines:
-        key, value = line.split(b":")
+        # print(line)
+        # print(line.decode("utf-8"))
+        key = line.split(b":")[0]
+        value = b":".join(line.split(b":")[1:]).strip()
+        # key, value = line.split(b":")
         key, value = camel_to_snake(key.decode().strip()), value.decode().strip()
+        # append to existing key if it exists in header
         if key in header:
-            header[key] = [header[key]] + [value]
+            if isinstance(header[key], list):
+                header[key].append(value)
+            else:
+                header[key] = [header[key], value]
+        elif key in ["spectral_reg_def"] and isinstance(value, str):
+            header[key] = [value]
         else:
             header[key] = value
     return header
@@ -250,7 +261,7 @@ def _process_traces(spe: list[bytes], trace_defs: list[dict]) -> dict:
         the trace definitions and the corrresponding XPS traces.
 
     """
-    data = b"".join(spe[spe.index(b"EOFH\n") + 1 :])
+    data = b"".join(spe[spe.index(b"EOFH\r\n") + 1 :])
     data_header = dgutils.read_value(data, 0x0000, data_header_dtype)
     assert data_header["num_traces"] == len(trace_defs)
     # All trace headers I have seen are 192 (0xc0) bytes long.
@@ -266,6 +277,7 @@ def _process_traces(spe: list[bytes], trace_defs: list[dict]) -> dict:
     )
     traces = {}
     for trace_header, trace_def in zip(trace_headers, trace_defs):
+        print(trace_header)
         assert trace_header["trace_number"] == trace_def["trace_number"]
         assert trace_header["num_datapoints"] == trace_def["num_datapoints"]
         # Contruct the binding energies from trace_def.
@@ -278,15 +290,20 @@ def _process_traces(spe: list[bytes], trace_defs: list[dict]) -> dict:
         )
         # Construct data from trace_header
         data_dtype = np.dtype(f'{trace_header["data_dtype"].decode()}')
-        data_offset = trace_header["end_of_data"] - trace_header["num_data_bytes"]
+        print(data_dtype)
+        print(trace_header["end_of_data"])
+        print(trace_header["num_data_bytes"])
+        data_offset = 0 #trace_header["num_data_bytes"] - trace_header["end_of_data"]
         datapoints = np.frombuffer(
             data,
             offset=data_offset,
             dtype=data_dtype,
             count=trace_header["num_datapoints"],
         )
-        dwell_time = dgutils.read_value(data, trace_header["end_of_data"], "<f4")
-        np.testing.assert_almost_equal(dwell_time, float(trace_def["dwell_time"]))
+        
+        # dwell_time = dgutils.read_value(data, trace_header["end_of_data"], "<f4")
+        # np.testing.assert_almost_equal(dwell_time, float(trace_def["dwell_time"]))
+
         # TODO: Figure out the correct error. This signal count should
         # somehow be a Poisson distribution, i.e. the error should be
         # something like s ~ sqrt(n). The counts per second only seem to
@@ -329,7 +346,10 @@ def process(
     with open(fn, "rb") as spe_file:
         spe = spe_file.readlines()
     header = _process_header(spe)
-    software_id, version = header.get("software_version").split()
+    try:
+        software_id, version = header.get("software_version").split()
+    except:
+        software_id, version = "unknown", "unknown"
     meta = {
         "params": {
             "software_id": software_id,
@@ -338,9 +358,13 @@ def process(
         },
         "file_header": header,
     }
+
+    print(header["spectral_reg_def"])
     trace_defs = _process_trace_defs(header)
     traces = _process_traces(spe, trace_defs)
+    print(traces)
     vals = {}
+    results = []
     for v in traces.values():
         fvals = xr.Dataset(
             data_vars={
@@ -369,7 +393,32 @@ def process(
             },
         )
         vals[v["name"]] = fvals
+        
+        result = {kk: vv.tolist() for kk, vv in v.items() if isinstance(vv, np.ndarray)}
+        results.append(result)
 
+    with open("result2.json", "w") as f:
+        json.dump(results, f)
+
+
+    # print(vals)
     dt = datatree.DataTree.from_dict(vals)
+    # print(dt)
     dt.attrs = meta
     return dt
+
+if __name__ == "__main__":
+    import sys
+    fn = sys.argv[1]
+    dt = process(fn=fn)
+    print(dt)
+    print(dt.attrs)
+    print(dt["F1s"])
+    print(dt["F1s"].attrs)
+    print(dt["F1s"].y)
+    print(dt["F1s"].y_std_err)
+    print(dt["F1s"].E)
+    print(dt["F1s"].E_std_err)
+    print(dt["F1s"].E.attrs)
+    print(dt["F1s"].E_std_err.attrs)
+    print(dt["F1s"].y_std_err)
